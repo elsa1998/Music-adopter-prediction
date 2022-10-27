@@ -1,0 +1,283 @@
+---
+title: "XYZ Premium Convert Analysis"
+author: "Rebecca Meyer, Narae Kang, Shubham Garg, Pranvi Setia, Yun-Chien Yen"
+date: '2022-07-31'
+output:  pdf_document
+---
+# Introduction
+Our team conducted data analysis to predict which people would be likely to convert from free users to premium subscribers in the next 6 month period, if they are targeted by our promotional campaign.
+
+```{r setup, global_options, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE, tidy.opts=list(width.cutoff=40), tidy=TRUE)
+```
+
+## Import library
+Our analysis was performed in Jupyter Lab - RStudio. The packages needed to preform the following analysis are shown below. 
+```{r message=FALSE}
+library(dplyr)
+library(caret)
+library(rpart)
+library(class)
+library(pROC)
+library(e1071)
+library(kknn)
+library(FSelectorRcpp)
+library(doParallel)
+library(ROSE)
+library(ggplot2)
+library(GGally)
+library(gridExtra)
+library(rpart.plot)
+```
+We then uploaded the data using the read.csv() function. 
+First, we set variables (e.g. 'male', 'good_country') as binary factor type and take out user id from the data as it represents the key in data without analytical meanings.
+
+## Data Processing
+```{r}
+xyz <- read.csv("XYZData.csv")
+xyz$adopter <- as.factor(xyz$adopter)
+xyz <- xyz[2:27]
+xyz_for_normalization <- xyz
+xyz$male <- as.factor(xyz$male)
+xyz$good_country <- as.factor(xyz$good_country)
+```
+
+## Data Normalization and Train-test split
+```{r}
+# Define function 
+normalize = function(x){
+return ((x - min(x))/(max(x) - min(x)))}
+
+# Data normalization
+xyz_normalized = xyz_for_normalization %>% mutate_at(1:25, normalize)
+
+# Split dataset into 70% training and 30% testing
+train_rows = createDataPartition(y = xyz$adopter, p = 0.70, list = FALSE)
+```
+### For KNN, we used normalized data
+```{r}
+xyz_normalized_train = xyz_normalized[train_rows,]
+xyz_normalized_test = xyz_normalized[-train_rows,]
+```
+
+### For decision tree and Naive Bayes , we used the original data (without normalization)
+```{r}
+xyz_train = xyz[train_rows,]
+xyz_test = xyz[-train_rows,]
+```
+
+## Dealing with inbalanced data - oversampling
+While exploring the data, we found that for the predictor adopter, adopter = 1 has 1540 (3.7%) and adopter = 0 has 40000 (96.3%) records. We oversampled the dataset for the adopter = 1 (premium user), to balance the dataset to get better predictions for adopted = 1 class (premium users).
+
+```{r}
+table(xyz_train$adopter) 
+
+# Creating balanced dataset for Naive Bayes and Decision Tree
+xyz_train_balanced <- 
+  ovun.sample(adopter ~ ., data = xyz_train, method = "over",
+              N = 50000, seed = 1)$data
+table(xyz_train_balanced$adopter)
+
+# Creating balanced dataset for KNN
+xyz_train_balanced_normalized <- ovun.sample(adopter ~ ., data = xyz_normalized_train, method = "over", N = 50000, seed = 1)$data
+```
+
+# Feature Selection 
+We used the filter approach to find the most important features. We used the information_gain() function in the FselectorRcpp package. The function outputs information gains for each feature. Then, we used the cut_attrs() function to select the top k features. We tried multiple values of K and chose K = 8, to optimize the complexity of the model and the results obtained from it.
+
+```{r}
+# Selecting the top 8 feautures
+IG = information_gain(adopter ~ ., data = xyz_train_balanced)
+topK = cut_attrs(IG, k = 8)
+
+#Examining the top 8 features
+topK
+
+# Creating new training and testing datasets consisting of the top 8 features
+xyz_train_top8_balanced = xyz_train_balanced %>% select(topK, adopter)
+xyz_train_top8_balanced_normalized = xyz_train_balanced_normalized %>% select(topK, adopter)
+xyz_test_top8 = xyz_test %>% select(topK, adopter)
+xyz_test_top8_normalized = xyz_normalized_test %>% select(topK, adopter)
+```
+
+# Modeling 
+For the model building, we tried three methods : 
+(1) KNN 
+(2) Naive Bayes 
+(3) Decision Tree
+
+## KNN
+First, we looped through k = 3 to k= 20 and found the best k clusters.
+```{r}
+AUC_curve <- c()
+prec <- c()
+rec <- c()
+acc <- c()
+F1 <- c()
+
+for (n in 3:20) {
+  # knn model 
+  pred_knn = knn(train = xyz_train_top8_balanced_normalized[,1:8],
+                 test = xyz_test_top8_normalized[,1:8],
+                 cl = xyz_train_top8_balanced_normalized$adopter,
+                 k = n,
+                 prob = TRUE)
+  
+ cm = confusionMatrix(pred_knn,
+                  xyz_test_top8_normalized$adopter,
+                  positive = "1",
+                  mode = "prec_recall")
+ 
+ prec[n-2] = cm[["byClass"]][["Precision"]]
+ rec[n-2] = cm[["byClass"]][["Recall"]]
+ acc[n-2] = cm[["overall"]][["Accuracy"]]
+ F1[n-2] = cm[["byClass"]][["F1"]]
+ 
+ model_knn = kknn(adopter ~ ., 
+                  train = xyz_train_top8_balanced_normalized, 
+                  test = xyz_test_top8_normalized,
+                  k = n, 
+                  distance = 2)
+
+ pred_prob_knn = model_knn$prob
+  # caculate roc curve for each k
+  roc_curve = roc(response=
+                    ifelse(xyz_test_top8_normalized$adopter==
+                             '1', 1, 0),
+                  predictor = pred_prob_knn[,"1"])
+  
+  auc(roc_curve)
+  
+  AUC_curve[n-2] = auc(roc_curve)
+}
+```
+
+
+```{r}
+# Examine and plot the precision values for K = 3 to K = 20 for KNN..
+prec
+plot(1:18,
+     prec,
+     type = "b",
+     main = "Precision",
+     xlab = "Number of K", ylab = "Precision",
+     col = 'blue')
+
+# Examine and plot the recall values
+rec
+plot(1:18,
+     rec,
+     type = "b",
+     main = "Recall",
+     xlab = "Number of K", ylab = "Recall",
+     col = 'blue')
+
+# Examine and plot the accuracy values
+acc
+plot(1:18,
+     acc,
+     type = "b",
+     main = "Accuracy",
+     xlab = "Number of K", ylab = "Accuracy",
+     col = 'blue')
+
+# Examine and plot the F-measure values
+F1
+plot(1:18,
+     F1,
+     type = "b",
+     main = "F-measure",
+     xlab = "Number of K", ylab = "F-measure",
+     col = 'blue')
+
+# examine and plot the AUC values.
+AUC_curve
+plot(1:18,
+     AUC_curve,
+     type = "b",
+     main = "AUC Curve",
+     xlab = "Number of K", ylab = "AUC",
+     col = 'blue')
+```
+
+### Results for KNN
+After running multiple iterations of KNN, using K = 3 to K = 20 values for the nearest neighbors, we concluded that the KNN model with K = 9 performs the best which optimizes the precision and recall for the model.We noticed that the recall keeps increasing as we increase the value of k, but the precision keeps decreasing after K = 9. Hence, we have chosen this model as the best K-NN model.
+
+## Naive Bayes
+Next, we used the Naive bayes classifier to train the model and evaluate its performance.
+
+### Naive Bayes for top 8 features
+```{r}
+NB_model_balanced = naiveBayes(adopter ~ ., data = xyz_train_top8_balanced)
+pred_nb_balanced = predict(NB_model_balanced, xyz_test_top8)
+prob_pred_nb_balanced = predict(NB_model_balanced, xyz_test_top8, type = "raw")
+```
+
+### Confusion matrix and metrics
+```{r}
+confusionMatrix(data = pred_nb_balanced,
+                reference = xyz_test_top8$adopter,
+                positive = "1",
+                mode = "prec_recall")
+```
+
+## ROC curve
+```{r}
+roc = roc(response = xyz_test_top8$adopter,
+          predictor = prob_pred_nb_balanced[,"1"])
+plot(roc)
+auc(roc)
+```
+## Results for Naive Bayes
+The Naive Bayes algorithm performs slightly better than KNN, having a higher F-measure, precision, accuracy and AUC but worse recall.
+
+# Decision Tree
+Next, we used the decision tree algorithm to construct a classifier. We noticed that the feature susbcriber friend count was causing a lot of variation in the results because of outliers, so we decided to drop it and use top 7 features to build the decision tree model.
+
+```{r}
+xyz_train_dt <- xyz_train_top8_balanced %>% select(-subscriber_friend_cnt)
+xyz_test_dt <- xyz_test_top8 %>% select(-subscriber_friend_cnt)
+
+tree = rpart(adopter ~ ., 
+             data = xyz_train_dt, method = "class",
+             parms = list(split = "information"),
+             control = list(minsplit = 200, 
+                            maxdepth = 5, 
+                            cp = 0)) 
+```
+
+## Plotting
+```{r}
+tree$variable.importance
+rpart.plot(tree, type = 1, extra =4, cex=0.5)
+```
+## model evaluation
+```{r}
+pred = predict(tree, xyz_test_dt, type = "class")
+confusionMatrix(pred, as.factor(xyz_test_dt$adopter),
+                mode = "prec_recall", positive = '1')
+```
+## Result for Decision Tree
+We changed the parameters, minsplit and maxdepth, to find a decision tree with good precision, recall and F-measures and chose this decision tree.
+
+# Conclusion
+We chose decision tree as the best classifier for our case, because our main aim is to correctly classify the premium adopters. The decision tree has the highest recall, which represents the amount of premium adopters that were correctly classified out of all the actual premium adopters. While having a good recall rate, the decision tree classifier also doesn't degrade as much on precision as K-NN and Naive Bayes. It also has the best F-measure and a fairly good accuracy.
+
+# Appendix for variable plottings
+```{r}
+b1 = ggplot(data=xyz, aes(x=age)) +
+  geom_histogram(fill="steelblue", color="black") +
+  xlim(0, 100) + ggtitle("Age Dist")
+b2 = ggplot(data=xyz, aes(x=friend_cnt)) +
+  geom_histogram(fill="steelblue", color="black") + xlim(0, 2000) + ylim(0, 10000)
+ggtitle("friend_cnt Dist")
+b3 = ggplot(data=xyz, aes(x=songsListened)) + xlim(0, 25000) + 
+  geom_histogram(fill="steelblue", color="black") +
+  ggtitle("songsListened Dist")
+b4 = ggplot(data=xyz, aes(x=shouts)) +  xlim(0, 1000) + ylim(0, 7500) + 
+  geom_histogram(fill="steelblue", color="black") +
+  ggtitle("shouts Dist")
+
+grid.arrange(b1, b2, b3, b4)
+```
